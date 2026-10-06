@@ -1,0 +1,38 @@
+:root {
+  --color-bg: #fff;
+  --color-text: #111;
+  --font-base: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --space-page: clamp(24px, 6vw, 64px);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-base);
+}
+
+main {
+  display: flex;
+  align-items: flex-end;
+  min-height: 100vh;
+  min-height: 100svh;
+  padding: var(--space-page);
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+}
