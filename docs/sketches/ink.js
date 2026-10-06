@@ -14,6 +14,20 @@ window.SKETCHES.ink = function (p) {
   var BUOYANCY = 0.05;        // downward pull per unit of ink
   var VORTICITY = 0.12;
 
+  // Ink colors, roughly PCCS vivid tones (plus black). One is picked per page load.
+  var INKS = [
+    '#D7003A', // red
+    '#EE7800', // orange
+    '#FFD900', // yellow
+    '#8FC31F', // yellow green
+    '#00A05A', // green
+    '#0068B7', // blue
+    '#4D3C9E', // violet
+    '#7B2E8F', // purple
+    '#C0267B', // red purple
+    '#1F1F1F'  // black
+  ];
+
   var W, H, S;                // inner grid size and row stride (W + 2)
   var u, v, u0, v0;
   var d, d0, d1, d2, pr, dv, curl;
@@ -68,17 +82,9 @@ window.SKETCHES.ink = function (p) {
 
   // Ink color as per-channel absorption, so thin ink is pale and thick ink deepens.
   function pickInk() {
-    var rgb = hslToRgb(p.random(360), p.random(0.5, 0.85), p.random(0.25, 0.42));
+    var hex = p.random(INKS);
+    var rgb = [1, 3, 5].map(function (k) { return parseInt(hex.slice(k, k + 2), 16) / 255; });
     return rgb.map(function (c) { return -Math.log(Math.max(c, 0.02)); });
-  }
-
-  function hslToRgb(h, s, l) {
-    var a = s * Math.min(l, 1 - l);
-    function f(n) {
-      var k = (n + h / 30) % 12;
-      return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-    }
-    return [f(0), f(8), f(4)];
   }
 
   function initGrid() {
