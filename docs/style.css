@@ -22,7 +22,19 @@ body {
   font-family: var(--font-base);
 }
 
+#canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+}
+
+#canvas canvas {
+  display: block;
+}
+
 main {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: flex-end;
   min-height: 100vh;
