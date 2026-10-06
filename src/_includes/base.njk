@@ -1,0 +1,22 @@
+{%- set fullTitle = (title + " — " + site.title) if title else site.title -%}
+{%- set desc = description or site.description -%}
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ fullTitle }}</title>
+  <meta name="description" content="{{ desc }}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ site.title }}">
+  <meta property="og:title" content="{{ fullTitle }}">
+  <meta property="og:description" content="{{ desc }}">
+  <meta property="og:url" content="{{ site.url }}{{ page.url }}">
+  <meta property="og:locale" content="ja_JP">
+  <meta name="twitter:card" content="summary">
+  <link rel="stylesheet" href="{{ '/style.css' | rel(page.url) }}">
+</head>
+<body{% if bodyClass %} class="{{ bodyClass }}"{% endif %}>
+{{ content | safe }}
+</body>
+</html>

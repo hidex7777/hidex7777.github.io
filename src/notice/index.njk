@@ -1,0 +1,36 @@
+---
+layout: base.njk
+bodyClass: notice
+title: notice
+description: 斎藤秀雄（Hideo Saito）のお知らせ。掲載誌や作品の発表など。
+pagination:
+  data: collections.notice
+  size: 20
+  reverse: true
+permalink: "notice/{% if pagination.pageNumber > 0 %}{{ pagination.pageNumber + 1 }}/{% endif %}"
+---
+  <header class="site-header">
+    <a href="{{ '/' | rel(page.url) }}">Hideo Saito</a>
+  </header>
+  <main>
+    <h1>notice</h1>
+    <div class="notice-list">
+      {%- for post in pagination.items %}
+      <article class="notice-item">
+        {{ post.content | safe }}
+      </article>
+      {%- endfor %}
+    </div>
+    {%- if pagination.pages.length > 1 %}
+    <nav class="pager" aria-label="ページ">
+      {%- for href in pagination.hrefs %}
+      {%- if loop.index0 == pagination.pageNumber %}
+      <span aria-current="page">[{{ loop.index }}]</span>
+      {%- else %}
+      <a href="{{ href | rel(page.url) }}">[{{ loop.index }}]</a>
+      {%- endif %}
+      {%- endfor %}
+    </nav>
+    {%- endif %}
+  </main>
+  <script async src="https://platform.x.com/widgets.js" charset="utf-8"></script>

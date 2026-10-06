@@ -12,3 +12,6 @@ desktop.ini
 
 # Claude Code local preview
 .claude/launch.json
+
+# Node
+node_modules/
