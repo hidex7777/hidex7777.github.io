@@ -4,21 +4,33 @@
 
 ## 技術方針
 
-- **ビルドツールは使わない。** 素の HTML / CSS で書く。
-  - 静的サイトジェネレーター（Jekyll、Hugo など）、バンドラー、CSS プリプロセッサ、npm パッケージは導入しない。
+- **静的サイトジェネレーターは Eleventy（11ty）を使う。** ローカルでビルドし、生成物をコミットする。
+  - 手で書くファイルは `src/`、Eleventy が作る公開用ファイルは `docs/`。**`docs/` は直接編集しない。**
+  - `npm start` で確認用サーバー（http://localhost:8000 、変更を自動で反映）、`npm run build` で `docs/` を作り直す。
+  - コミット前に必ず `npm run build` を実行し、`src/` と `docs/` を一緒にコミットする。
+  - ページは Nunjucks（`.njk`）で書き、共通の `<head>`（title・description・OGP）は `src/_includes/base.njk` にまとめる。サイト共通の値は `src/_data/site.json`。
+  - CSS や JS は Eleventy では加工せず、そのままコピーする（`eleventy.config.js` の passthrough）。バンドラーや CSS プリプロセッサは使わない。
 - **公開されるのは `docs/` の中だけ。** GitHub Pages の公開元は `main` ブランチの `/docs`。
-  - サイトのファイル（HTML / CSS / 画像など）はすべて `docs/` に置く。`docs/` に置いたファイルはそのまま公開される。
-  - `CLAUDE.md`、`README.md` など公開しないファイルはリポジトリのルートに置く。
+  - `CLAUDE.md`、`README.md`、`src/` など公開しないファイルはリポジトリのルートに置く。
 - JavaScript は原則使わない。どうしても必要な場合だけ、最小限の素の JS をインラインか単独ファイルで書く（フレームワーク・外部ライブラリは使わない）。
   - 例外：トップページ背景の generative art には p5.js を使う。CDN（jsDelivr）から、バージョンを固定して読み込む。
-- トップページの背景作品は `docs/sketches/` に1作品1ファイルで置く。
+  - 例外：notice ページでは X の埋め込み用スクリプト（`widgets.js`）を読み込む。ほかのページでは読み込まない。
+- トップページの背景作品は `src/sketches/` に1作品1ファイルで置く。
   - 各ファイルは `window.SKETCHES.<名前>` に `function (p, host)` を登録する。`p` は p5 のインスタンス、`host` は描画先の要素。
   - 重い計算は WebGL2 のシェーダーで行ってよい。その場合は自前のキャンバスを `host` に置き、p5 はフレームの進行と画面サイズの変化への対応に使う。
-  - `docs/main.js` の一覧に名前を加えると、読み込みのたびにランダムに1つが選ばれる。
-  - ES Modules は使わない（ファイルを直接開いても動くように）。
+  - `src/main.js` の一覧に名前を加えると、読み込みのたびにランダムに1つが選ばれる。
+  - ES Modules は使わない。
   - `prefers-reduced-motion` が有効なときは、アニメーションせず静止画を表示する。
-- GitHub Pages の Jekyll 処理を避けるため、`docs/.nojekyll` を置く。
-- 相対パスでリンクし、ローカルでファイルを直接開いても表示が崩れないようにする。
+- GitHub Pages の Jekyll 処理を避けるため、`docs/.nojekyll` を置く（`src/.nojekyll` からコピーされる）。
+- リンクや CSS・JS の参照は相対パスにする。テンプレートでは `rel` フィルターを使う（例：`{{ '/style.css' | rel(page.url) }}`）。
+
+## notice（お知らせ）
+
+- `src/notice/posts/` に1件1ファイルで置く。ファイル名は `YYYY-MM-DD-<短い名前>.html`。
+- 中身は先頭に日付を書き、その下に X の埋め込み HTML（`<blockquote class="twitter-tweet">…</blockquote>`）を貼る。
+  - 埋め込みコードの末尾の `<script … widgets.js>` は貼らない（notice ページで1回だけ読み込む）。
+  - `<blockquote>` に `data-dnt="true"` を付ける（X に閲覧者の追跡をしないよう求める指定）。
+- 新しい順に並び、20件ごとに `notice/`、`notice/2/`、`notice/3/` …とページが分かれる（`src/notice/index.njk`）。
 
 ## デザイン方針
 
