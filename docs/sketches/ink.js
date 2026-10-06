@@ -1,18 +1,23 @@
 // Ink dropped into a water tank, seen from the side.
-// A small grid-based fluid simulation (Stable Fluids) carries an ink density field.
+// A grid-based fluid simulation (Stable Fluids) runs on the GPU with WebGL2 shaders.
+// The water flow uses a coarse grid and the ink a fine one, so the ink stays crisp.
 // Ink is heavier than water, so it sinks; as it falls it rolls up into mushroom
 // caps and curling tendrils. Ink slowly fades as it settles and dilutes.
+// p5 only drives the frame loop; drawing goes to our own WebGL2 canvas.
 
 window.SKETCHES = window.SKETCHES || {};
 
-window.SKETCHES.ink = function (p) {
-  var RES = 200;              // cells along the longer side of the screen
-  var PRESSURE_ITERS = 20;
-  var SOR = 1.7;
+window.SKETCHES.ink = function (p, host) {
+  var SIM_RES = 256;          // water flow: cells along the longer side
+  var DYE_RES = 1024;         // ink: cells along the longer side
+  var PRESSURE_ITERS = 30;
+  var PRESSURE_KEEP = 0.9;    // warm start from the previous frame's pressure
   var VELOCITY_DAMP = 0.998;
-  var INK_DECAY = 0.9992;
-  var BUOYANCY = 0.05;        // downward pull per unit of ink
-  var VORTICITY = 0.12;
+  var INK_DECAY_TOP = 0.9995;  // ink fades slowly near the surface…
+  var INK_DECAY_BOTTOM = 0.992; // …and faster as it settles near the bottom
+  var BUOYANCY = 0.03;        // downward pull per unit of ink (flow cells per frame)
+  var VORTICITY = 0.1;
+  var INK_FLOOR = 0.03;        // ink thinner than this is not drawn, so no haze lingers
 
   // Ink colors, roughly PCCS vivid tones (plus black). One is picked per page load.
   var INKS = [
@@ -28,10 +33,9 @@ window.SKETCHES.ink = function (p) {
     '#1F1F1F'  // black
   ];
 
-  var W, H, S;                // inner grid size and row stride (W + 2)
-  var u, v, u0, v0;
-  var d, d0, d1, d2, pr, dv, curl;
-  var buffer, bufferCtx, imageData;
+  var canvas, gl, quad, formats, prog;
+  var velocity, pressure, divergence, curl, dye, dyeFwd, dyeBack;
+  var simW, simH, dyeW, dyeH;
   var absorb;
   var t = 0;
   var nextDrop = 0;
@@ -41,16 +45,32 @@ window.SKETCHES.ink = function (p) {
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   p.setup = function () {
-    p.pixelDensity(1);
-    p.createCanvas(p.windowWidth, p.windowHeight);
-    absorb = pickInk();
-    initGrid();
+    p.noCanvas();
+    canvas = document.createElement('canvas');
+    canvas.style.display = 'block';
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    host.appendChild(canvas);
 
-    addDrop(W * p.random(0.3, 0.7));
+    gl = canvas.getContext('webgl2', {
+      alpha: false, depth: false, stencil: false, antialias: false
+    });
+    if (!gl || !(formats = findFormats())) {
+      // Without WebGL2 half-float targets the background simply stays white.
+      p.noLoop();
+      return;
+    }
+
+    absorb = pickInk();
+    initGL();
+    resizeCanvas();
+    initFields();
+
+    addDrop(p.random(0.3, 0.7));
     nextDrop = p.random(300, 480);
 
     window.addEventListener('pointerdown', function (e) {
-      addDrop(e.clientX / p.width * W + 0.5);
+      addDrop(e.clientX / window.innerWidth);
       if (reduceMotion) settle();
     });
 
@@ -59,7 +79,7 @@ window.SKETCHES.ink = function (p) {
 
   p.draw = function () {
     if (t >= nextDrop) {
-      addDrop(W * p.random(0.15, 0.85));
+      addDrop(p.random(0.15, 0.85));
       nextDrop = t + p.random(360, 720);
     }
     step();
@@ -67,10 +87,11 @@ window.SKETCHES.ink = function (p) {
   };
 
   p.windowResized = function () {
-    p.resizeCanvas(p.windowWidth, p.windowHeight);
-    var aspect = p.width / p.height;
-    if (Math.abs(aspect - gridAspect) / gridAspect > 0.15) initGrid();
-    if (reduceMotion) render();
+    if (!formats) return;
+    resizeCanvas();
+    var aspect = canvas.width / canvas.height;
+    if (Math.abs(aspect - gridAspect) / gridAspect > 0.15) initFields();
+    render();
   };
 
   // Without animation, run the simulation ahead and show a single still frame.
@@ -87,228 +108,411 @@ window.SKETCHES.ink = function (p) {
     return rgb.map(function (c) { return -Math.log(Math.max(c, 0.02)); });
   }
 
-  function initGrid() {
-    gridAspect = p.width / p.height;
-    if (gridAspect >= 1) {
-      W = RES;
-      H = Math.max(8, Math.round(RES / gridAspect));
-    } else {
-      H = RES;
-      W = Math.max(8, Math.round(RES * gridAspect));
-    }
-    S = W + 2;
-    var n = S * (H + 2);
-    u = new Float32Array(n);
-    v = new Float32Array(n);
-    u0 = new Float32Array(n);
-    v0 = new Float32Array(n);
-    d = new Float32Array(n);
-    d0 = new Float32Array(n);
-    d1 = new Float32Array(n);
-    d2 = new Float32Array(n);
-    pr = new Float32Array(n);
-    dv = new Float32Array(n);
-    curl = new Float32Array(n);
-    buffer = document.createElement('canvas');
-    buffer.width = W;
-    buffer.height = H;
-    bufferCtx = buffer.getContext('2d');
-    imageData = bufferCtx.createImageData(W, H);
+  function resizeCanvas() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(window.innerWidth * dpr);
+    canvas.height = Math.round(window.innerHeight * dpr);
   }
 
-  // A drop hits the surface at x: a blob of ink just below the surface,
-  // pushed downward, with a little noise so it does not fall symmetrically.
+  function gridSize(res, aspect) {
+    return aspect >= 1
+      ? [res, Math.max(8, Math.round(res / aspect))]
+      : [Math.max(8, Math.round(res * aspect)), res];
+  }
+
+  function initFields() {
+    gridAspect = canvas.width / canvas.height;
+    var s = gridSize(SIM_RES, gridAspect);
+    var d = gridSize(DYE_RES, gridAspect);
+    simW = s[0]; simH = s[1];
+    dyeW = d[0]; dyeH = d[1];
+    velocity = doubleTarget(simW, simH, formats.rg);
+    pressure = doubleTarget(simW, simH, formats.r);
+    divergence = target(simW, simH, formats.r);
+    curl = target(simW, simH, formats.r);
+    dye = doubleTarget(dyeW, dyeH, formats.r);
+    dyeFwd = target(dyeW, dyeH, formats.r);
+    dyeBack = target(dyeW, dyeH, formats.r);
+  }
+
+  // A drop hits the surface at x (0–1 across the screen): a blob of ink just below
+  // the surface, pushed downward, with a little noise so it does not fall symmetrically.
   function addDrop(x) {
-    var scale = RES / 200;
-    var r = p.random(2.8, 4) * scale;
-    var y = r * 1.5 + 1;
-    var ink = p.random(2, 3);
-    var push = p.random(0.3, 0.6);
-    var reach = Math.ceil(r * 3);
-    for (var j = 1; j <= Math.min(H, Math.ceil(y + reach)); j++) {
-      for (var i = Math.max(1, Math.floor(x - reach)); i <= Math.min(W, Math.ceil(x + reach)); i++) {
-        var dx = i - x;
-        var dy = j - y;
-        var g = Math.exp(-(dx * dx + dy * dy) / (r * r));
-        var id = i + S * j;
-        d[id] += ink * g * p.random(0.7, 1.3);
-        v[id] += push * g;
-        u[id] += p.random(-0.08, 0.08) * g;
-      }
-    }
+    var r = p.random(2.8, 4) / 200;              // radius as a fraction of the longer side
+    var long = Math.max(canvas.width, canvas.height);
+    var y = 1 - (r * 1.5 + 0.005) * long / canvas.height;
+    var common = {
+      uPoint: [x, y],
+      uRadius: r * long,
+      uScreen: [canvas.width, canvas.height],
+      uSeed: p.random(1000)
+    };
+    run(prog.splatDye, dye.write, assign(common, {
+      uTarget: dye.read,
+      uAmount: p.random(2, 3)
+    }));
+    dye.swap();
+    run(prog.splatVelocity, velocity.write, assign(common, {
+      uTarget: velocity.read,
+      uPush: p.random(0.3, 0.6),
+      uJitter: 0.08
+    }));
+    velocity.swap();
   }
 
   function step() {
     t++;
-    addForces();
+    var simTexel = [1 / simW, 1 / simH];
 
-    u0.set(u);
-    v0.set(v);
-    advect(u, u0, u0, v0, 1);
-    advect(v, v0, u0, v0, 1);
-    velocityBoundary(u, v);
-    project();
+    run(prog.curl, curl, { uTexel: simTexel, uVelocity: velocity.read });
+    run(prog.forces, velocity.write, {
+      uTexel: simTexel,
+      uVelocity: velocity.read,
+      uCurl: curl,
+      uDye: dye.read,
+      uVorticity: VORTICITY,
+      uBuoyancy: BUOYANCY
+    });
+    velocity.swap();
 
-    advectInk();
-
-    for (var id = 0; id < d.length; id++) {
-      d[id] *= INK_DECAY;
-      u[id] *= VELOCITY_DAMP;
-      v[id] *= VELOCITY_DAMP;
-    }
-    densityBoundary();
-  }
-
-  // Ink is heavier than water (buoyancy), and vorticity confinement keeps the curls alive.
-  function addForces() {
-    var i, j, id;
-    for (j = 1; j <= H; j++) {
-      for (i = 1; i <= W; i++) {
-        id = i + S * j;
-        v[id] += BUOYANCY * d[id];
-        curl[id] = 0.5 * ((v[id + 1] - v[id - 1]) - (u[id + S] - u[id - S]));
-      }
-    }
-    for (j = 2; j < H; j++) {
-      for (i = 2; i < W; i++) {
-        id = i + S * j;
-        var gx = 0.5 * (Math.abs(curl[id + 1]) - Math.abs(curl[id - 1]));
-        var gy = 0.5 * (Math.abs(curl[id + S]) - Math.abs(curl[id - S]));
-        var len = Math.sqrt(gx * gx + gy * gy) + 1e-5;
-        u[id] += VORTICITY * (gy / len) * curl[id];
-        v[id] -= VORTICITY * (gx / len) * curl[id];
-      }
-    }
-  }
-
-  // MacCormack advection keeps thin filaments of ink sharp: advect forward,
-  // back again, and correct by half the round-trip error, clamped to the
-  // values the forward step sampled from.
-  function advectInk() {
-    d0.set(d);
-    advect(d1, d0, u, v, 1);
-    advect(d2, d1, u, v, -1);
-    var maxX = W + 0.5;
-    var maxY = H + 0.5;
-    for (var j = 1; j <= H; j++) {
-      for (var i = 1; i <= W; i++) {
-        var id = i + S * j;
-        var x = Math.min(Math.max(i - u[id], 0.5), maxX);
-        var y = Math.min(Math.max(j - v[id], 0.5), maxY);
-        var a = Math.floor(x) + S * Math.floor(y);
-        var c0 = d0[a], c1 = d0[a + 1], c2 = d0[a + S], c3 = d0[a + S + 1];
-        var lo = Math.min(c0, c1, c2, c3);
-        var hi = Math.max(c0, c1, c2, c3);
-        var val = d1[id] + 0.5 * (d0[id] - d2[id]);
-        d[id] = val < lo ? lo : val > hi ? hi : val;
-      }
-    }
-  }
-
-  // Semi-Lagrangian advection: trace each cell back along the flow
-  // (or forward, with dir = -1).
-  function advect(dst, s, uu, vv, dir) {
-    var maxX = W + 0.5;
-    var maxY = H + 0.5;
-    for (var j = 1; j <= H; j++) {
-      for (var i = 1; i <= W; i++) {
-        var id = i + S * j;
-        var x = Math.min(Math.max(i - dir * uu[id], 0.5), maxX);
-        var y = Math.min(Math.max(j - dir * vv[id], 0.5), maxY);
-        var ix = Math.floor(x);
-        var iy = Math.floor(y);
-        var sx = x - ix;
-        var sy = y - iy;
-        var a = ix + S * iy;
-        dst[id] = (1 - sy) * ((1 - sx) * s[a] + sx * s[a + 1]) +
-                  sy * ((1 - sx) * s[a + S] + sx * s[a + S + 1]);
-      }
-    }
-  }
-
-  // Make the flow divergence-free. Pressure is kept between frames as a warm start.
-  function project() {
-    var i, j, id;
-    for (j = 1; j <= H; j++) {
-      for (i = 1; i <= W; i++) {
-        id = i + S * j;
-        dv[id] = 0.5 * (u[id + 1] - u[id - 1] + v[id + S] - v[id - S]);
-      }
-    }
+    run(prog.divergence, divergence, { uTexel: simTexel, uVelocity: velocity.read });
+    run(prog.scale, pressure.write, { uTarget: pressure.read, uValue: PRESSURE_KEEP });
+    pressure.swap();
     for (var k = 0; k < PRESSURE_ITERS; k++) {
-      for (j = 1; j <= H; j++) {
-        for (i = 1; i <= W; i++) {
-          id = i + S * j;
-          var next = (pr[id - 1] + pr[id + 1] + pr[id - S] + pr[id + S] - dv[id]) * 0.25;
-          pr[id] += SOR * (next - pr[id]);
-        }
-      }
-      copyEdges(pr);
+      run(prog.pressure, pressure.write, {
+        uTexel: simTexel,
+        uPressure: pressure.read,
+        uDivergence: divergence
+      });
+      pressure.swap();
     }
-    for (j = 1; j <= H; j++) {
-      for (i = 1; i <= W; i++) {
-        id = i + S * j;
-        u[id] -= 0.5 * (pr[id + 1] - pr[id - 1]);
-        v[id] -= 0.5 * (pr[id + S] - pr[id - S]);
-      }
-    }
-    velocityBoundary(u, v);
-  }
+    run(prog.gradient, velocity.write, {
+      uTexel: simTexel,
+      uPressure: pressure.read,
+      uVelocity: velocity.read
+    });
+    velocity.swap();
 
-  // The tank: water cannot pass through the walls, the bottom, or the surface,
-  // but may slide along them.
-  function velocityBoundary(uu, vv) {
-    var i, j;
-    for (i = 1; i <= W; i++) {
-      uu[i] = uu[i + S];
-      vv[i] = -vv[i + S];
-      uu[i + S * (H + 1)] = uu[i + S * H];
-      vv[i + S * (H + 1)] = -vv[i + S * H];
-    }
-    for (j = 1; j <= H; j++) {
-      uu[S * j] = -uu[1 + S * j];
-      vv[S * j] = vv[1 + S * j];
-      uu[W + 1 + S * j] = -uu[W + S * j];
-      vv[W + 1 + S * j] = vv[W + S * j];
-    }
-  }
+    run(prog.advect, velocity.write, {
+      uVelocity: velocity.read,
+      uSource: velocity.read,
+      uSimTexel: simTexel,
+      uDirection: 1,
+      uDissipation: VELOCITY_DAMP
+    });
+    velocity.swap();
 
-  // Ink stays in the tank.
-  function densityBoundary() {
-    copyEdges(d);
-  }
-
-  function copyEdges(f) {
-    var i, j;
-    for (i = 1; i <= W; i++) {
-      f[i] = f[i + S];
-      f[i + S * (H + 1)] = f[i + S * H];
-    }
-    for (j = 0; j < H + 2; j++) {
-      f[S * j] = f[1 + S * j];
-      f[W + 1 + S * j] = f[W + S * j];
-    }
+    // MacCormack advection keeps thin filaments of ink sharp: advect forward,
+    // back again, and correct by half the round-trip error, clamped to the
+    // values the forward step sampled from.
+    var ink = { uVelocity: velocity.read, uSimTexel: simTexel, uDissipation: 1 };
+    run(prog.advect, dyeFwd, assign(ink, { uSource: dye.read, uDirection: 1 }));
+    run(prog.advect, dyeBack, assign(ink, { uSource: dyeFwd, uDirection: -1 }));
+    run(prog.maccormack, dye.write, {
+      uVelocity: velocity.read,
+      uSimTexel: simTexel,
+      uSource: dye.read,
+      uForward: dyeFwd,
+      uBack: dyeBack,
+      uSize: [dyeW, dyeH],
+      uDecayTop: INK_DECAY_TOP,
+      uDecayBottom: INK_DECAY_BOTTOM
+    });
+    dye.swap();
   }
 
   // White water; ink absorbs light per channel (Beer–Lambert).
   function render() {
-    // Write pixels into our own small buffer (no readback), then scale it up.
-    var px = imageData.data;
-    var o = 0;
-    for (var j = 1; j <= H; j++) {
-      for (var i = 1; i <= W; i++) {
-        var dd = d[i + S * j];
-        px[o] = 255 * Math.exp(-dd * absorb[0]);
-        px[o + 1] = 255 * Math.exp(-dd * absorb[1]);
-        px[o + 2] = 255 * Math.exp(-dd * absorb[2]);
-        px[o + 3] = 255;
-        o += 4;
-      }
+    run(prog.display, null, { uDye: dye.read, uAbsorb: absorb, uFloor: INK_FLOOR });
+  }
+
+  // ---- WebGL plumbing ----
+
+  var VERTEX = [
+    '#version 300 es',
+    'in vec2 aPosition;',
+    'uniform vec2 uTexel;',
+    'out vec2 vUv, vL, vR, vT, vB;',
+    'void main() {',
+    '  vUv = aPosition * 0.5 + 0.5;',
+    '  vL = vUv - vec2(uTexel.x, 0.0);',
+    '  vR = vUv + vec2(uTexel.x, 0.0);',
+    '  vT = vUv + vec2(0.0, uTexel.y);',
+    '  vB = vUv - vec2(0.0, uTexel.y);',
+    '  gl_Position = vec4(aPosition, 0.0, 1.0);',
+    '}'
+  ].join('\n');
+
+  var HEADER = [
+    '#version 300 es',
+    'precision highp float;',
+    'precision highp sampler2D;',
+    'in vec2 vUv, vL, vR, vT, vB;',
+    'out vec4 outColor;',
+    'float hash(vec2 q) { return fract(sin(dot(q, vec2(12.9898, 78.233))) * 43758.5453); }',
+    ''
+  ].join('\n');
+
+  // In these shaders y points up: the surface is at the top (uv.y = 1).
+  var FRAGMENTS = {
+    curl: [
+      'uniform sampler2D uVelocity;',
+      'void main() {',
+      '  float L = texture(uVelocity, vL).y, R = texture(uVelocity, vR).y;',
+      '  float T = texture(uVelocity, vT).x, B = texture(uVelocity, vB).x;',
+      '  outColor = vec4(0.5 * ((R - L) - (T - B)), 0.0, 0.0, 1.0);',
+      '}'
+    ],
+    // Vorticity confinement keeps the curls alive; ink is heavier than water.
+    forces: [
+      'uniform sampler2D uVelocity, uCurl, uDye;',
+      'uniform float uVorticity, uBuoyancy;',
+      'void main() {',
+      '  float L = abs(texture(uCurl, vL).x), R = abs(texture(uCurl, vR).x);',
+      '  float T = abs(texture(uCurl, vT).x), B = abs(texture(uCurl, vB).x);',
+      '  float C = texture(uCurl, vUv).x;',
+      '  vec2 g = 0.5 * vec2(R - L, T - B);',
+      '  g /= length(g) + 1e-5;',
+      '  vec2 v = texture(uVelocity, vUv).xy;',
+      '  v += uVorticity * vec2(g.y, -g.x) * C;',
+      '  v.y -= uBuoyancy * texture(uDye, vUv).x;',
+      '  outColor = vec4(v, 0.0, 1.0);',
+      '}'
+    ],
+    // The tank walls, bottom and surface reflect the flow.
+    divergence: [
+      'uniform sampler2D uVelocity;',
+      'void main() {',
+      '  vec2 C = texture(uVelocity, vUv).xy;',
+      '  float L = texture(uVelocity, vL).x, R = texture(uVelocity, vR).x;',
+      '  float T = texture(uVelocity, vT).y, B = texture(uVelocity, vB).y;',
+      '  if (vL.x < 0.0) L = -C.x;',
+      '  if (vR.x > 1.0) R = -C.x;',
+      '  if (vT.y > 1.0) T = -C.y;',
+      '  if (vB.y < 0.0) B = -C.y;',
+      '  outColor = vec4(0.5 * (R - L + T - B), 0.0, 0.0, 1.0);',
+      '}'
+    ],
+    scale: [
+      'uniform sampler2D uTarget;',
+      'uniform float uValue;',
+      'void main() { outColor = uValue * texture(uTarget, vUv); }'
+    ],
+    pressure: [
+      'uniform sampler2D uPressure, uDivergence;',
+      'void main() {',
+      '  float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x;',
+      '  float T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;',
+      '  float d = texture(uDivergence, vUv).x;',
+      '  outColor = vec4(0.25 * (L + R + T + B - d), 0.0, 0.0, 1.0);',
+      '}'
+    ],
+    gradient: [
+      'uniform sampler2D uPressure, uVelocity;',
+      'void main() {',
+      '  float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x;',
+      '  float T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;',
+      '  vec2 v = texture(uVelocity, vUv).xy - 0.5 * vec2(R - L, T - B);',
+      '  outColor = vec4(v, 0.0, 1.0);',
+      '}'
+    ],
+    // Semi-Lagrangian advection: trace back along the flow (or forward, with direction -1).
+    advect: [
+      'uniform sampler2D uVelocity, uSource;',
+      'uniform vec2 uSimTexel;',
+      'uniform float uDirection, uDissipation;',
+      'void main() {',
+      '  vec2 from = vUv - uDirection * texture(uVelocity, vUv).xy * uSimTexel;',
+      '  outColor = uDissipation * texture(uSource, from);',
+      '}'
+    ],
+    maccormack: [
+      'uniform sampler2D uVelocity, uSource, uForward, uBack;',
+      'uniform vec2 uSimTexel, uSize;',
+      'uniform float uDecayTop, uDecayBottom;',
+      'void main() {',
+      '  vec2 from = vUv - texture(uVelocity, vUv).xy * uSimTexel;',
+      '  ivec2 i = ivec2(floor(from * uSize - 0.5));',
+      '  ivec2 hi = ivec2(uSize) - 1;',
+      '  float a = texelFetch(uSource, clamp(i, ivec2(0), hi), 0).x;',
+      '  float b = texelFetch(uSource, clamp(i + ivec2(1, 0), ivec2(0), hi), 0).x;',
+      '  float c = texelFetch(uSource, clamp(i + ivec2(0, 1), ivec2(0), hi), 0).x;',
+      '  float d = texelFetch(uSource, clamp(i + ivec2(1, 1), ivec2(0), hi), 0).x;',
+      '  float f = texture(uForward, vUv).x;',
+      '  float v = f + 0.5 * (texture(uSource, vUv).x - texture(uBack, vUv).x);',
+      '  v = clamp(v, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));',
+      '  float decay = mix(uDecayBottom, uDecayTop, smoothstep(0.0, 0.7, vUv.y));',
+      '  outColor = vec4(decay * v, 0.0, 0.0, 1.0);',
+      '}'
+    ],
+    splatDye: [
+      'uniform sampler2D uTarget;',
+      'uniform vec2 uPoint, uScreen;',
+      'uniform float uRadius, uAmount, uSeed;',
+      'void main() {',
+      '  vec2 d = (vUv - uPoint) * uScreen;',
+      '  float g = exp(-dot(d, d) / (uRadius * uRadius));',
+      '  float grain = 0.7 + 0.6 * hash(vUv * 917.0 + uSeed);',
+      '  outColor = texture(uTarget, vUv) + vec4(uAmount * g * grain, 0.0, 0.0, 0.0);',
+      '}'
+    ],
+    splatVelocity: [
+      'uniform sampler2D uTarget;',
+      'uniform vec2 uPoint, uScreen;',
+      'uniform float uRadius, uPush, uJitter, uSeed;',
+      'void main() {',
+      '  vec2 d = (vUv - uPoint) * uScreen;',
+      '  float g = exp(-dot(d, d) / (uRadius * uRadius));',
+      '  float jitter = uJitter * (2.0 * hash(vUv * 613.0 + uSeed) - 1.0);',
+      '  outColor = texture(uTarget, vUv) + vec4(jitter * g, -uPush * g, 0.0, 0.0);',
+      '}'
+    ],
+    display: [
+      'uniform sampler2D uDye;',
+      'uniform vec3 uAbsorb;',
+      'uniform float uFloor;',
+      'void main() {',
+      '  float ink = max(texture(uDye, vUv).x - uFloor, 0.0);',
+      '  outColor = vec4(exp(-ink * uAbsorb), 1.0);',
+      '}'
+    ]
+  };
+
+  function initGL() {
+    quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    var vs = compile(gl.VERTEX_SHADER, VERTEX);
+    prog = {};
+    Object.keys(FRAGMENTS).forEach(function (name) {
+      prog[name] = link(vs, compile(gl.FRAGMENT_SHADER, HEADER + FRAGMENTS[name].join('\n')));
+    });
+  }
+
+  function compile(type, source) {
+    var shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader));
     }
-    bufferCtx.putImageData(imageData, 0, 0);
-    var ctx = p.drawingContext;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(buffer, 0, 0, p.width, p.height);
+    return shader;
+  }
+
+  function link(vs, fs) {
+    var program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.bindAttribLocation(program, 0, 'aPosition');
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program));
+    }
+    var uniforms = {};
+    var count = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    for (var k = 0; k < count; k++) {
+      var info = gl.getActiveUniform(program, k);
+      uniforms[info.name] = { location: gl.getUniformLocation(program, info.name), type: info.type };
+    }
+    return { program: program, uniforms: uniforms };
+  }
+
+  // Draw a full-screen quad with a program into a target (null = the screen).
+  function run(pr, dest, values) {
+    gl.useProgram(pr.program);
+    var unit = 0;
+    Object.keys(pr.uniforms).forEach(function (name) {
+      var u = pr.uniforms[name];
+      var value = values[name];
+      if (value === undefined) return;
+      if (u.type === gl.SAMPLER_2D) {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, value.texture);
+        gl.uniform1i(u.location, unit++);
+      } else if (u.type === gl.FLOAT) {
+        gl.uniform1f(u.location, value);
+      } else if (u.type === gl.FLOAT_VEC2) {
+        gl.uniform2fv(u.location, value);
+      } else if (u.type === gl.FLOAT_VEC3) {
+        gl.uniform3fv(u.location, value);
+      }
+    });
+    if (dest) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dest.framebuffer);
+      gl.viewport(0, 0, dest.width, dest.height);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  function target(w, h, format) {
+    var texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, format.internal, w, h, 0, format.format, gl.HALF_FLOAT, null);
+    var framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    return { texture: texture, framebuffer: framebuffer, width: w, height: h };
+  }
+
+  function doubleTarget(w, h, format) {
+    var pair = {
+      read: target(w, h, format),
+      write: target(w, h, format),
+      swap: function () {
+        var tmp = pair.read;
+        pair.read = pair.write;
+        pair.write = tmp;
+      }
+    };
+    return pair;
+  }
+
+  // Half-float render targets need an extension; fall back to wider formats
+  // where one- or two-channel targets are not renderable.
+  function findFormats() {
+    if (!gl.getExtension('EXT_color_buffer_float') &&
+        !gl.getExtension('EXT_color_buffer_half_float')) return null;
+    var r = [gl.R16F, gl.RED], rg = [gl.RG16F, gl.RG], rgba = [gl.RGBA16F, gl.RGBA];
+    var pick = function (list) {
+      for (var k = 0; k < list.length; k++) {
+        if (renderable(list[k][0], list[k][1])) return { internal: list[k][0], format: list[k][1] };
+      }
+      return null;
+    };
+    var result = { r: pick([r, rg, rgba]), rg: pick([rg, rgba]) };
+    return result.r && result.rg ? result : null;
+  }
+
+  function renderable(internal, format) {
+    var texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, 4, 4, 0, format, gl.HALF_FLOAT, null);
+    var framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    var ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.deleteFramebuffer(framebuffer);
+    gl.deleteTexture(texture);
+    return ok;
+  }
+
+  function assign(base, extra) {
+    var out = {};
+    Object.keys(base).forEach(function (k) { out[k] = base[k]; });
+    Object.keys(extra).forEach(function (k) { out[k] = extra[k]; });
+    return out;
   }
 };
